@@ -16,7 +16,8 @@ import sys
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QCheckBox, QComboBox, QFrame,
-    QSpinBox, QPushButton, QTextEdit, QVBoxLayout, QHBoxLayout, QGroupBox
+    QSpinBox, QPushButton, QTextEdit, QVBoxLayout, QHBoxLayout, QGroupBox,
+    QMessageBox
 )
 
 import serial
@@ -27,6 +28,10 @@ import si5351_gen as g
 FRAME_SYNC_STORE = 0xA5   # controller saves to flash, then applies
 FRAME_SYNC_APPLY = 0xA7   # controller only applies; the stored config is untouched
 FRAME_SYNC_READ = 0xA8    # controller reads the listed Si5351 registers back
+FRAME_SYNC_CMD = 0xA9     # one-byte command, below
+CMD_RESTORE_DEFAULTS = 0x01   # power-on crystal load + stored config
+CMD_CLEAR_STORED = 0x02       # erase the stored config, then restore
+ACK_BAD_CMD = 0xE0
 ACK_OK = 0xA6             # applied, every register acknowledged
 ACK_I2C_FAIL = 0xE5       # frame arrived but the Si5351 did not answer
 ACK_LEN = 4               # status, pair count, checksum, flags
@@ -261,6 +266,23 @@ class Si5351Tool(QWidget):
         self.read_btn.clicked.connect(self.on_read)
         row5.addWidget(self.read_btn)
         adv.addLayout(row5)
+
+        # Back to normal without a power cycle, and a way out of a bad
+        # stored config.
+        row6 = QHBoxLayout()
+        self.restore_btn = QPushButton("Restore chip defaults")
+        self.restore_btn.setToolTip(
+            "Put the crystal load back to the chip's own power-on value and "
+            "re-apply the stored frequency.")
+        self.restore_btn.clicked.connect(self.on_restore)
+        row6.addWidget(self.restore_btn)
+        self.clear_btn = QPushButton("Clear stored config")
+        self.clear_btn.setToolTip(
+            "Erase the stored setting; the board falls back to 82 MHz on CLK0.")
+        self.clear_btn.clicked.connect(self.on_clear)
+        row6.addWidget(self.clear_btn)
+        row6.addStretch(1)
+        adv.addLayout(row6)
         arow = QHBoxLayout()
         self.gen_btn = QPushButton("Generate")
         self.gen_btn.clicked.connect(self.on_generate)
@@ -508,6 +530,60 @@ class Si5351Tool(QWidget):
             role = register_role(a)
             self.log.append("  reg %3d (0x%02X) = 0x%02X  %s%s" % (
                 a, a, v, format(v, "08b"), "  " + role if role else ""))
+
+    def _command(self, cmd):
+        """Send a one-byte command frame and report the reply in the log."""
+        if self.serial is None or not self.serial.is_open:
+            self.log.append("[serial] click 'Connect' first")
+            return
+        frame = bytes([FRAME_SYNC_CMD, 1, cmd, cmd])
+        try:
+            self.serial.reset_input_buffer()
+            self.serial.write(frame)
+            self.serial.flush()
+            reply = self.serial.read(ACK_LEN)
+        except Exception as e:
+            self.serial_status.setText("serial error: %s" % e)
+            self.log.append("[serial] error: %s" % e)
+            return
+        if len(reply) < ACK_LEN:
+            self.serial_status.setText("no reply from controller")
+            self.log.append("No reply. Firmware older than this command does not "
+                            "answer it — flash the current one.")
+            return
+        status, echo, load, flags = reply
+        if status == ACK_BAD_CMD or echo != cmd:
+            self.log.append("[controller] did not recognise the command.")
+            return
+        # What is on screen should not go out again on the next auto-send.
+        self.load_combo.blockSignals(True)
+        self.load_combo.setCurrentIndex(0)
+        self.load_combo.blockSignals(False)
+        what = "stored frequency" if flags & 1 else "built-in 82 MHz fallback"
+        if not flags & 4:
+            self.log.append("[controller] the chip's power-on crystal load is not "
+                            "known (the Si5351 did not answer at start-up). Power-"
+                            "cycle the board to restore it.")
+        if status == ACK_OK:
+            self.serial_status.setText("restored")
+            self.log.append("[controller] crystal load back to 0x%02X, %s applied, "
+                            "PLLs reset." % (load, what))
+        else:
+            self.serial_status.setText("Si5351 did not answer")
+            self.log.append("[controller] %s applied, but the Si5351 did not "
+                            "acknowledge every write." % what)
+
+    def on_restore(self):
+        self._command(CMD_RESTORE_DEFAULTS)
+
+    def on_clear(self):
+        ask = QMessageBox.question(
+            self, "Clear stored config",
+            "Erase the frequency stored on the board? It will run the built-in "
+            "82 MHz on CLK0 until you press Send sequence again.")
+        if ask != QMessageBox.Yes:
+            return
+        self._command(CMD_CLEAR_STORED)
 
     def on_generate(self):
         res, err = self._registers()

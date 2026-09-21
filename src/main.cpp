@@ -262,6 +262,13 @@ static const uint8_t FALLBACK_REGS[][2] = {
 // Read frame: the payload is a list of register numbers. Reply: STATUS, count,
 // one value per register (0 where the read failed), checksum of the values.
 #define FRAME_SYNC_READ  0xA8
+// Command frame: a one-byte payload naming what to do. Reply: STATUS, the
+// command, the power-on value of reg 183, FLAGS (bit0 = stored config applied,
+// bit1 = Si5351 acknowledged, bit2 = power-on reg 183 known).
+#define FRAME_SYNC_CMD   0xA9
+#define CMD_RESTORE_DEFAULTS 0x01   // power-on crystal load + stored config
+#define CMD_CLEAR_STORED     0x02   // erase the stored config, then restore
+#define ACK_BAD_CMD 0xE0
 #define RX_MAX_LEN 60
 // Reply on the software TX pin: STATUS, pair count, payload checksum,
 // FLAGS (bit0 = written to flash, bit1 = Si5351 acknowledged every write).
@@ -300,6 +307,20 @@ static void uart_rx_begin(unsigned long baud) {
 
 // True once something has actually acknowledged at 0x60.
 static bool si5351_ok = false;
+
+// Reg 183 (crystal load) as the chip held it before this firmware wrote
+// anything. Its reserved bits differ between chips, so "back to normal" means
+// this value, not the datasheet's. It is the true power-on value only when the
+// Si5351 was powered up with the controller; a reset of the controller alone
+// (after flashing, say) captures whatever the chip holds at that moment.
+#define SI5351_CRYSTAL_LOAD 183
+static uint8_t boot_load = 0;
+static bool boot_load_known = false;
+
+static void capture_boot_load(void) {
+  if (!boot_load_known && si5351_ok)
+    boot_load_known = i2c_read_reg(SI5351_CRYSTAL_LOAD, &boot_load);
+}
 
 static bool si5351_begin(void) {
   i2c_periph_init();
@@ -400,7 +421,8 @@ static void flash_save_pairs(const uint8_t *p, int n) {
 }
 
 // Load saved config from flash and replay it to Si5351. Returns false if no valid config.
-static bool flash_load_and_apply(void) {
+// skip_load leaves reg 183 out, for restoring the chip's own crystal load.
+static bool flash_load_and_apply(bool skip_load) {
   uint16_t count = *(volatile uint16_t *)SI5351_CFG_PAGE;
   if (count == 0xFFFF || count == 0 || count > RX_MAX_LEN / 2) return false;
   uint8_t sum = 0;
@@ -411,7 +433,16 @@ static bool flash_load_and_apply(void) {
   }
   uint8_t stored = *(volatile uint8_t *)(SI5351_CFG_PAGE + 2 + 2 * count);
   if (sum != stored) return false;
-  si5351_apply((const uint8_t *)(SI5351_CFG_PAGE + 2), count);
+  uint8_t pairs[RX_MAX_LEN];
+  int m = 0;
+  for (int i = 0; i < count; i++) {
+    uint8_t reg = *(volatile uint8_t *)(SI5351_CFG_PAGE + 2 + 2 * i);
+    if (skip_load && reg == SI5351_CRYSTAL_LOAD) continue;
+    pairs[2 * m] = reg;
+    pairs[2 * m + 1] = *(volatile uint8_t *)(SI5351_CFG_PAGE + 3 + 2 * i);
+    m++;
+  }
+  si5351_apply(pairs, m);
   return true;
 }
 
@@ -424,6 +455,7 @@ static uint16_t rx_sum = 0;
 
 static void process_config(const uint8_t *p, int n, bool store) {
   if (!si5351_ok) si5351_begin();  // retry if the chip was absent at boot
+  capture_boot_load();             // before this frame can change it
   if (store) {
     flash_save_pairs(p, n);
     diag_stored++;
@@ -458,10 +490,45 @@ static void process_read(const uint8_t *regs, int n) {
   tx_byte(sum);
 }
 
+// Put the Si5351 back to normal without a power cycle: its own power-on crystal
+// load, then the stored config (without any load it carries) or the built-in
+// fallback, then a reset of both PLLs so they relock onto the crystal.
+static void process_command(uint8_t cmd) {
+  if (cmd != CMD_RESTORE_DEFAULTS && cmd != CMD_CLEAR_STORED) {
+    tx_byte(ACK_BAD_CMD);
+    tx_byte(cmd);
+    tx_byte(0);
+    tx_byte(0);
+    return;
+  }
+  if (!si5351_ok) si5351_begin();
+  capture_boot_load();
+  if (cmd == CMD_CLEAR_STORED) {
+    flash_unlock();
+    flash_erase_page(SI5351_CFG_PAGE);
+    flash_lock();
+  }
+  bool ok = boot_load_known && i2c_write_reg(SI5351_CRYSTAL_LOAD, boot_load);
+  bool from_flash = flash_load_and_apply(true);
+  if (from_flash) {
+    ok = ok && i2c_diag_fail_cnt == 0;
+  } else {
+    ok = si5351_apply(&FALLBACK_REGS[0][0],
+                      (int)(sizeof(FALLBACK_REGS) / sizeof(FALLBACK_REGS[0]))) && ok;
+  }
+  ok = i2c_write_reg(177, 0xA0) && ok;   // PLL soft reset, A and B
+  cfg_from_flash = from_flash ? 1 : 0;
+  tx_byte(ok ? ACK_OK : ACK_I2C_FAIL);
+  tx_byte(cmd);
+  tx_byte(boot_load);
+  tx_byte((uint8_t)((from_flash ? 1 : 0) | (si5351_ok ? 2 : 0) | (boot_load_known ? 4 : 0)));
+}
+
 static void on_serial_byte(uint8_t b) {
   switch (rx_state) {
     case 0:
-      if (b == FRAME_SYNC_STORE || b == FRAME_SYNC_APPLY || b == FRAME_SYNC_READ) {
+      if (b == FRAME_SYNC_STORE || b == FRAME_SYNC_APPLY || b == FRAME_SYNC_READ ||
+          b == FRAME_SYNC_CMD) {
         rx_sync = b;
         rx_state = 1;
       }
@@ -481,6 +548,9 @@ static void on_serial_byte(uint8_t b) {
     case 3:
       if (b == (uint8_t)rx_sum) {
         if (rx_sync == FRAME_SYNC_READ) process_read(rx_payload, rx_expected);
+        else if (rx_sync == FRAME_SYNC_CMD) {
+          if (rx_expected == 1) process_command(rx_payload[0]);
+        }
         else process_config(rx_payload, rx_expected / 2, rx_sync == FRAME_SYNC_STORE);
       }
       rx_state = 0;
@@ -492,7 +562,8 @@ void setup() {
   uart_rx_begin(115200);
   tx_begin();
   si5351_begin();
-  cfg_from_flash = flash_load_and_apply() ? 1 : 0;
+  capture_boot_load();   // before the stored config can overwrite it
+  cfg_from_flash = flash_load_and_apply(false) ? 1 : 0;
   if (!cfg_from_flash) {
     si5351_apply(&FALLBACK_REGS[0][0],
                  (int)(sizeof(FALLBACK_REGS) / sizeof(FALLBACK_REGS[0])));

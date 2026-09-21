@@ -136,10 +136,10 @@ guess. With 8 pF, that board came out at +9.3 ppm with no correction at all.
 connected. So:
 
 - Experiment with **Auto-send on change (apply only)** ticked. Nothing is
-  written to flash, and power-cycling the board brings it back.
+  written to flash, and **Restore chip defaults** brings it back.
 - If you press **Send sequence** with a load selected, the load is stored and
-  replayed on every boot. To undo it, send again with *chip default* and
-  power-cycle the board.
+  replayed on every boot. To undo it, send again with *chip default*, then
+  press **Restore chip defaults** (or power-cycle the board).
 - Unticking **Advanced** puts it back to *chip default*, so a load nobody can
   see is never sent by accident.
 
@@ -212,6 +212,31 @@ CHKSUM  sum of VALUES modulo 256
 **Read registers** under **Advanced** in the tool sends this frame. It accepts
 decimal or `0x` hex numbers and ranges, e.g. `0, 3, 26-33, 183`. Reading
 changes nothing on the chip. Firmware older than this frame does not answer it.
+
+### Back to normal without a power cycle
+
+The Si5351 has no software reset for the whole chip, and it shares its supply
+with the controller. So at start-up, before writing anything, the firmware
+reads reg 183 (crystal load) and remembers it. Two buttons under **Advanced**
+use that:
+
+- **Restore chip defaults** writes the remembered reg 183 back, re-applies the
+  stored frequency without any crystal load it carries (or the built-in
+  82 MHz fallback if nothing is stored), and resets both PLLs.
+- **Clear stored config** asks first, erases the stored setting, then does the
+  same. The board runs the 82 MHz fallback until **Send sequence** stores a new
+  one. This is the way out when something bad got stored.
+
+The remembered value is the chip's true power-on value only if the Si5351 was
+powered up together with the controller. Reflashing resets the controller
+alone, so after flashing, power-cycle the board once before relying on
+**Restore**.
+
+Both are `SYNC 0xA9` frames with a one-byte payload (`0x01` restore, `0x02`
+clear). The reply is four bytes: `STATUS` (`0xA6` ok, `0xE5` the Si5351 did
+not acknowledge every write, `0xE0` unknown command), the command echoed, the
+remembered reg 183 value, and `FLAGS` (bit0 = the stored config was applied,
+bit1 = Si5351 healthy, bit2 = the power-on reg 183 is known).
 
 You can also read the stored config back over the WCH-Link while the firmware
 runs:

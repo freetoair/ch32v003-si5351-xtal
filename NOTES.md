@@ -72,6 +72,9 @@ Frame: `SYNC | LEN | (reg,val) pairs | CHECKSUM`.
 - **`SYNC 0xA7`** — apply only, leave the stored config alone.
 - **`SYNC 0xA8`** — read: the payload lists register numbers, and the reply is
   `STATUS`, count, one value per register, checksum of the values.
+- **`SYNC 0xA9`** — command, one-byte payload: `0x01` restores the chip's
+  power-on crystal load (reg 183, read at start-up) and re-applies the stored
+  config, `0x02` erases the stored config first.
 
 The GUI's auto-send uses `0xA7` so that turning the correction spinner does not
 spend flash write endurance; the **Send sequence** button sends `0xA5`.
