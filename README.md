@@ -99,6 +99,12 @@ pio run -t upload
 
 CI builds both natively on every tag and attaches them to the release.
 
+## Maintaining
+
+Day-to-day procedures — publishing a change, cutting a release, flashing a
+board, recovering one that has locked the debug probe out — are in
+[MAINTAINING.md](MAINTAINING.md).
+
 ## Authors
 
 - **freetoair (YT1BN)** — idea, hardware, and every measurement that decided
