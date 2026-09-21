@@ -104,7 +104,7 @@ static void i2c_bus_recover(void) {
 
 // ---- diagnostics, readable over the debug probe ----
 // i2c_diag_step: 0 = ok, 1 = bus stuck busy, 2 = no SB, 3 = no ADDR (NAK/timeout),
-//                4 = no TXE, 5 = no BTF
+//                4 = no TXE, 5 = no BTF, 6 = no RXNE
 volatile uint8_t  i2c_diag_step;
 volatile uint16_t i2c_diag_star1;
 volatile uint16_t i2c_diag_star2;
@@ -182,6 +182,37 @@ static bool i2c_write_reg(uint8_t reg, uint8_t val) {
   return false;
 }
 
+// Read one Si5351 register: write the register number, then a repeated
+// START in the read direction. A single-byte read has to NAK its only byte,
+// so ACK is cleared before ADDR is, and STOP is set before the byte arrives.
+static bool i2c_read_reg_once(uint8_t reg, uint8_t *val) {
+  if (!i2c_start_write(SI5351_ADDR)) return false;
+  if (!i2c_wait(I2C_STAR1_TXE)) { i2c_diag(4); i2c_abort(); return false; }
+  I2C1->DATAR = reg;
+  if (!i2c_wait(I2C_STAR1_BTF)) { i2c_diag(5); i2c_abort(); return false; }
+  I2C1->CTLR1 |= I2C_CTLR1_START;
+  if (!i2c_wait(I2C_STAR1_SB)) { i2c_diag(2); i2c_abort(); return false; }
+  I2C1->DATAR = (uint16_t)((SI5351_ADDR << 1) | 1);   // read direction
+  if (!i2c_wait(I2C_STAR1_ADDR)) { i2c_diag(3); i2c_abort(); return false; }
+  I2C1->CTLR1 &= ~I2C_CTLR1_ACK;
+  (void)I2C1->STAR1;
+  (void)I2C1->STAR2;
+  I2C1->CTLR1 |= I2C_CTLR1_STOP;
+  bool ok = i2c_wait(I2C_STAR1_RXNE);
+  if (ok) *val = (uint8_t)I2C1->DATAR;
+  else i2c_diag(6);
+  I2C1->CTLR1 |= I2C_CTLR1_ACK;
+  if (ok) i2c_diag_step = 0;
+  return ok;
+}
+
+static bool i2c_read_reg(uint8_t reg, uint8_t *val) {
+  for (int a = 0; a < I2C_ATTEMPTS; a++) {
+    if (i2c_read_reg_once(reg, val)) return true;
+  }
+  return false;
+}
+
 // Address-only transaction: does anything answer at this address?
 static bool i2c_probe_addr(uint8_t addr7) {
   if (!i2c_start_write(addr7)) return false;
@@ -223,11 +254,14 @@ static const uint8_t FALLBACK_REGS[][2] = {
 };
 
 // ---- Serial RX state machine: frame = SYNC LEN PAYLOAD CHECKSUM ----
-// Two frame kinds, so tuning does not wear the flash out. The correction
+// Two write frame kinds, so tuning does not wear the flash out. The correction
 // spinner can emit a frame per step; at one page erase each that would burn
 // through the endurance budget in a tuning session.
 #define FRAME_SYNC_STORE 0xA5   // save to flash, then apply
 #define FRAME_SYNC_APPLY 0xA7   // apply only, leave the stored config alone
+// Read frame: the payload is a list of register numbers. Reply: STATUS, count,
+// one value per register (0 where the read failed), checksum of the values.
+#define FRAME_SYNC_READ  0xA8
 #define RX_MAX_LEN 60
 // Reply on the software TX pin: STATUS, pair count, payload checksum,
 // FLAGS (bit0 = written to flash, bit1 = Si5351 acknowledged every write).
@@ -382,7 +416,7 @@ static bool flash_load_and_apply(void) {
 }
 
 static uint8_t rx_state = 0;
-static uint8_t rx_store = 0;
+static uint8_t rx_sync = 0;
 static uint8_t rx_payload[RX_MAX_LEN];
 static uint8_t rx_len = 0;
 static uint8_t rx_expected = 0;
@@ -405,11 +439,32 @@ static void process_config(const uint8_t *p, int n, bool store) {
   tx_byte((uint8_t)((store ? 1 : 0) | (si5351_ok ? 2 : 0)));
 }
 
+// Answer a read frame. Reading changes nothing on the Si5351.
+static void process_read(const uint8_t *regs, int n) {
+  if (!si5351_ok) si5351_begin();
+  uint8_t vals[RX_MAX_LEN];
+  bool ok = true;
+  for (int i = 0; i < n; i++) {
+    vals[i] = 0;
+    if (!i2c_read_reg(regs[i], &vals[i])) ok = false;
+  }
+  uint8_t sum = 0;
+  tx_byte(ok ? ACK_OK : ACK_I2C_FAIL);
+  tx_byte((uint8_t)n);
+  for (int i = 0; i < n; i++) {
+    tx_byte(vals[i]);
+    sum = (uint8_t)(sum + vals[i]);
+  }
+  tx_byte(sum);
+}
+
 static void on_serial_byte(uint8_t b) {
   switch (rx_state) {
     case 0:
-      if (b == FRAME_SYNC_STORE)      { rx_store = 1; rx_state = 1; }
-      else if (b == FRAME_SYNC_APPLY) { rx_store = 0; rx_state = 1; }
+      if (b == FRAME_SYNC_STORE || b == FRAME_SYNC_APPLY || b == FRAME_SYNC_READ) {
+        rx_sync = b;
+        rx_state = 1;
+      }
       break;
     case 1:
       if (b > RX_MAX_LEN) { rx_state = 0; break; }
@@ -425,7 +480,8 @@ static void on_serial_byte(uint8_t b) {
       break;
     case 3:
       if (b == (uint8_t)rx_sum) {
-        process_config(rx_payload, rx_expected / 2, rx_store != 0);
+        if (rx_sync == FRAME_SYNC_READ) process_read(rx_payload, rx_expected);
+        else process_config(rx_payload, rx_expected / 2, rx_sync == FRAME_SYNC_STORE);
       }
       rx_state = 0;
       break;

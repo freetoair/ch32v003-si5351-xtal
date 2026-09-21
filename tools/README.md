@@ -114,10 +114,22 @@ the PLL, whose soft reset at the end relocks it. The default, *chip default
 every earlier version behaved.
 
 On one board (chip marked only "5351", crystal "25,00") the output ran
-+333 ppm high with the register left alone, and writing it at all (10 pF and
-0 pF both tried) broke the carrier up into noise spread over several MHz until
-the board was power-cycled. The +333 ppm was corrected with **Correction**
-instead. So:
++333 ppm high. Reading the chip back (**Read registers**) showed why: reg 183
+powers up as `0x00`, i.e. 0 pF, not the datasheet's `0xD2`. The crystal is an
+ordinary one; measured with only bits 7:6 written and bits 5:0 left at the
+chip's `000000`:
+
+| reg 183 | load | crystal |
+|---|---|---|
+| `0x00` | 0 pF (power-on) | +333 ppm |
+| `0x40` | 6 pF | +49 ppm |
+| `0x80` | 8 pF | +9 ppm |
+| `0xC0` | 10 pF | −15 ppm |
+
+This field, however, writes bits 5:0 as `010010`, as the datasheet and the
+Etherkit library do, and on that board that broke the carrier up into noise
+spread over several MHz until a power cycle. Read reg 183 first; if it does
+not come back as `xx010010`, do not use this field on that board. So:
 
 - Experiment with **Auto-send on change (apply only)** ticked. Nothing is
   written to flash, and power-cycling the board brings it back.
@@ -179,6 +191,23 @@ FLAGS   bit0 = written to flash, bit1 = Si5351 healthy
 
 The tool shows this in plain language, so a missing or miswired Si5351 is
 reported rather than silently ignored.
+
+### Reading registers back
+
+`SYNC 0xA8` asks for Si5351 registers instead of writing them. `PAYLOAD` is a
+list of register numbers, one byte each, at most 60, and the checksum is formed
+the same way. The reply is:
+
+```
+STATUS  0xA6 = every read acknowledged / 0xE5 = at least one was not
+COUNT   number of registers
+VALUES  one byte per register, in the order asked (0x00 where a read failed)
+CHKSUM  sum of VALUES modulo 256
+```
+
+**Read registers** under **Advanced** in the tool sends this frame. It accepts
+decimal or `0x` hex numbers and ranges, e.g. `0, 3, 26-33, 183`. Reading
+changes nothing on the chip. Firmware older than this frame does not answer it.
 
 You can also read the stored config back over the WCH-Link while the firmware
 runs:

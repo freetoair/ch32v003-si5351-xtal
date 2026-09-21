@@ -26,12 +26,36 @@ import si5351_gen as g
 
 FRAME_SYNC_STORE = 0xA5   # controller saves to flash, then applies
 FRAME_SYNC_APPLY = 0xA7   # controller only applies; the stored config is untouched
+FRAME_SYNC_READ = 0xA8    # controller reads the listed Si5351 registers back
 ACK_OK = 0xA6             # applied, every register acknowledged
 ACK_I2C_FAIL = 0xE5       # frame arrived but the Si5351 did not answer
 ACK_LEN = 4               # status, pair count, checksum, flags
 
 DRIVES = {0: "2 mA", 1: "4 mA", 2: "6 mA", 3: "8 mA"}
 XTALS = {25000000: "25 MHz", 27000000: "27 MHz"}
+
+
+def build_read_frame(addrs):
+    """Register numbers -> a read frame (same SYNC LEN PAYLOAD CHECKSUM shape)."""
+    payload = bytes(a & 0xFF for a in addrs)
+    return bytes([FRAME_SYNC_READ, len(payload)]) + payload + bytes([sum(payload) & 0xFF])
+
+
+def parse_reg_list(text):
+    """'0, 3, 26-33, 0xB7' -> [0, 3, 26, ..., 33, 183]. Raises ValueError."""
+    addrs = []
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = (int(x.strip(), 0) for x in part.split("-", 1))
+            addrs.extend(range(lo, hi + 1))
+        else:
+            addrs.append(int(part, 0))
+    if not addrs or any(not 0 <= a <= 255 for a in addrs) or len(addrs) > 60:
+        raise ValueError(text)
+    return addrs
 
 
 def build_frame(registers, store=True):
@@ -63,6 +87,12 @@ def register_role(addr):
         return "PLL soft reset"
     if addr == 183:
         return "crystal load capacitance"
+    if addr == 0:
+        return "device status (SYS_INIT, LOL_A/B, LOS)"
+    if addr == 15:
+        return "PLL input source"
+    if addr == 187:
+        return "fanout enable"
     if 16 <= addr <= 23:
         return "CLK%d_CTRL: multisynth source, drive" % (addr - 16)
     if 26 <= addr <= 33:
@@ -219,6 +249,18 @@ class Si5351Tool(QWidget):
         row4.addWidget(self.load_combo)
         row4.addStretch(1)
         adv.addLayout(row4)
+
+        # Read registers back from the chip, to see what it actually holds.
+        row5 = QHBoxLayout()
+        row5.addWidget(QLabel("Read registers:"))
+        self.read_edit = QLineEdit("0, 3, 15, 16, 26-33, 42-49, 177, 183, 187")
+        self.read_edit.setToolTip("Register numbers, decimal or 0x hex, ranges "
+                                  "like 26-33; at most 60.")
+        row5.addWidget(self.read_edit, 1)
+        self.read_btn = QPushButton("Read")
+        self.read_btn.clicked.connect(self.on_read)
+        row5.addWidget(self.read_btn)
+        adv.addLayout(row5)
         arow = QHBoxLayout()
         self.gen_btn = QPushButton("Generate")
         self.gen_btn.clicked.connect(self.on_generate)
@@ -400,6 +442,46 @@ class Si5351Tool(QWidget):
         self._send(store=False)
 
     # ---------------- advanced ----------------
+
+    def on_read(self):
+        """'Read' button: ask the controller for the listed Si5351 registers."""
+        if self.serial is None or not self.serial.is_open:
+            self.log.append("[serial] click 'Connect' first")
+            return
+        try:
+            addrs = parse_reg_list(self.read_edit.text())
+        except ValueError:
+            self.log.append("Could not read the register list. Use numbers 0-255, "
+                            "decimal or 0x hex, ranges like 26-33, at most 60.")
+            return
+        try:
+            self.serial.reset_input_buffer()
+            self.serial.write(build_read_frame(addrs))
+            self.serial.flush()
+            reply = self.serial.read(len(addrs) + 3)
+        except Exception as e:
+            self.serial_status.setText("serial error: %s" % e)
+            self.log.append("[serial] error: %s" % e)
+            return
+        if len(reply) < len(addrs) + 3:
+            self.serial_status.setText("no reply to the read")
+            self.log.append(
+                "No reply to the read (%d of %d bytes). Firmware older than the "
+                "register read does not answer it — flash the current one."
+                % (len(reply), len(addrs) + 3))
+            return
+        status, count, vals, checksum = reply[0], reply[1], reply[2:-1], reply[-1]
+        if count != len(addrs) or checksum != sum(vals) & 0xFF:
+            self.log.append("[controller] the read reply is garbled; try again.")
+            return
+        if status != ACK_OK:
+            self.log.append("[controller] some reads were not acknowledged by the "
+                            "Si5351; those show as 0x00.")
+        self.serial_status.setText("read %d registers" % count)
+        for a, v in zip(addrs, vals):
+            role = register_role(a)
+            self.log.append("  reg %3d (0x%02X) = 0x%02X  %s%s" % (
+                a, a, v, format(v, "08b"), "  " + role if role else ""))
 
     def on_generate(self):
         res, err = self._registers()
