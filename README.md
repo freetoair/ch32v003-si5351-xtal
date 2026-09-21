@@ -67,7 +67,8 @@ serial port — on one cable.
 ## Notes worth knowing
 
 Getting this working turned up several things that are not obvious and that
-cost real debugging time. They are documented in [tools/README.md](tools/README.md):
+cost real debugging time. The full account is in [NOTES.md](NOTES.md), with the
+protocol and tool details in [tools/README.md](tools/README.md):
 
 - On the Arduino core for this chip, `TwoWire::endTransmission()` returns
   success whether or not the slave acknowledged, and returns an error for an
