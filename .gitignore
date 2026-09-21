@@ -1,0 +1,13 @@
+# PlatformIO
+.pio/
+
+# VS Code
+.vscode/
+
+# Build artifacts
+.build/
+dist/
+
+# Python
+__pycache__/
+*.pyc

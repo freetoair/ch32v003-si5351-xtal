@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    name: firmware (CH32V003)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install platformio
+      - run: pio run
+      - run: |
+          echo "### Firmware size" >> "$GITHUB_STEP_SUMMARY"
+          pio run --target size 2>&1 | grep -E "RAM:|Flash:" >> "$GITHUB_STEP_SUMMARY" || true
+
+  app:
+    name: tool (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: si5351-tool
+          - os: windows-latest
+            artifact: si5351-tool.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # PyInstaller imports PyQt5 to analyse it, and that needs the GL/EGL
+      # libraries present even though nothing is rendered during the build.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libegl1
+
+      - run: pip install pyinstaller PyQt5 pyserial
+      - run: >
+          pyinstaller --onefile --windowed --clean --noconfirm
+          --name si5351-tool --paths tools tools/si5351_tool.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [firmware, app]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -l release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

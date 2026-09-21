@@ -1,0 +1,2 @@
+This folder stores local libraries. The PlatformIO Library Dependency Manager will
+install external dependencies to the .pio directory.
