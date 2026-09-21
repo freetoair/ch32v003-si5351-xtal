@@ -105,6 +105,23 @@ assume ±10 ppm.
 The correction lives entirely in the tool: it is baked into the PLL registers
 that get sent, so the firmware needs no command and no setting of its own.
 
+### Two frequencies: A and B (e.g. a BFO for USB/LSB)
+
+Fill in **Frequency B** as well, and the board holds two frequencies on the same
+output: **A** while package pin 3 is open, **B** while pin 3 is grounded. Output,
+drive, crystal, correction and load are shared. Leave **Frequency B** empty for
+a single frequency; pin 3 then does nothing.
+
+- **Send sequence** stores both. **Auto-send** applies both without storing.
+- The log says which one is on the output. The other one is marked *kept for
+  when pin 3 selects it*.
+- The pin is debounced for 10 ms. Both frequencies come off the same 800 MHz
+  PLL, so a switch rewrites only the registers that differ (the multisynth
+  block) with no PLL reset: a few milliseconds, and the PLL stays locked.
+- Measured on the bench board with A = 100.000 MHz and B = 100.003 MHz: the
+  output followed the wire on pin 3 every time, stepping by 3.000 kHz with a
+  clean carrier.
+
 ### Crystal load (experimental)
 
 **Crystal load**, under **Advanced**, writes the Si5351 crystal load
@@ -171,6 +188,8 @@ Frame sent by the tool to the controller:
 - `SYNC` selects what the controller does with the frame:
   - `0xA5` — **commit**: save to flash, then apply.
   - `0xA7` — **apply only**: drive the Si5351, leave the stored config alone.
+  - `0xAA` / `0xAB` — the same two for **frequency B**. A B frame with no
+    pairs removes B.
 
   Everything after the SYNC byte is identical for both.
 - `LEN` = number of bytes in PAYLOAD (= 2 × number of (reg, val) pairs)
@@ -178,11 +197,14 @@ Frame sent by the tool to the controller:
 - `CHECKSUM` = sum of all PAYLOAD bytes, taken modulo 256.
 
 The controller (firmware) parses the frame in `loop()`. For a valid frame it:
-1. stores the pairs in flash — last 1KB page, at **`0x08003C00`**: unlock, page
+1. stores the pairs in flash — last 1KB page, A at **`0x08003C00`** and B at
+   **`0x08003C40`**, each `[count][pairs][checksum]`: unlock, page
    erase, word program (WCH FPEC, keys `0x45670123`/`0xCDEF89AB`). The flash
    controller only accepts the real `0x08000000` mapping; erases and programs
    issued against the `0x00000000` execution alias are silently ignored.
-2. applies them to the Si5351 over a bounded I2C path (see **I2C** below).
+2. applies them to the Si5351 over a bounded I2C path (see **I2C** below) —
+   but only if pin 3 selects that frequency; otherwise it keeps them for when
+   it does.
 The controller replies on its software TX pin with four bytes:
 
 ```
@@ -190,7 +212,8 @@ STATUS  0xA6 = applied, every register acknowledged by the Si5351
         0xE5 = frame received, but nothing answered at 0x60
 COUNT   number of (reg, val) pairs it acted on
 CHKSUM  the payload checksum it computed
-FLAGS   bit0 = written to flash, bit1 = Si5351 healthy
+FLAGS   bit0 = written to flash, bit1 = Si5351 healthy,
+        bit2 = kept for later (pin 3 selects the other frequency)
 ```
 
 The tool shows this in plain language, so a missing or miswired Si5351 is

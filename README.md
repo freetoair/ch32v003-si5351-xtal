@@ -21,6 +21,7 @@ shop does not stock.
 | Outputs | CLK0–CLK7, drive strength 2 / 4 / 6 / 8 mA |
 | Reference | 25 MHz or 27 MHz crystal, with a ppb correction you can trim against a counter |
 | Persistence | the setting is stored in the MCU's flash and restored on power-up |
+| Two frequencies | optional frequency B, selected by grounding pin 3 — e.g. a BFO switching USB/LSB |
 
 The accuracy is roughly a thousand times better than the tolerance of the
 crystal being replaced (typically ±20–50 ppm), so the synthesis is never the
@@ -53,12 +54,16 @@ layout more than the pin count suggests:
 |---|---|---|
 | 1 | PD6 | serial adapter **TX** |
 | 2 | VSS | ground |
-| 3 | PA2 | — |
+| 3 | PA2 | optional: to ground selects **frequency B** |
 | 4 | VDD | 3.3 V |
 | 5 | PC1 / SDA | Si5351 **SDA** |
 | 6 | PC2 / SCL | Si5351 **SCL** |
 | 7 | PC4 | serial adapter **RX** |
 | 8 | PD1 / SWIO | WCH-LinkE **SWDIO** (programming only) |
+
+Pin 3 is pulled up inside the chip: leave it open for frequency A, or connect
+it to ground (pin 2 is next to it) for frequency B. A switch, a relay contact
+or the radio's own USB/LSB line pulling to ground all work.
 
 Do not forget I²C pull-up resistors on SDA and SCL if your Si5351 board has
 none. A WCH-LinkE can supply all of it — 3.3 V, ground, SWDIO and its own

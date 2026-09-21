@@ -70,6 +70,9 @@ Frame: `SYNC | LEN | (reg,val) pairs | CHECKSUM`.
 
 - **`SYNC 0xA5`** — commit: write to flash, then apply.
 - **`SYNC 0xA7`** — apply only, leave the stored config alone.
+- **`SYNC 0xAA` / `0xAB`** — the same two for frequency B, put on the output
+  while package pin 3 (PA2, pulled up) is grounded. B is stored 64 bytes after
+  A in the same page, so a board with an older single config keeps it as A.
 - **`SYNC 0xA8`** — read: the payload lists register numbers, and the reply is
   `STATUS`, count, one value per register, checksum of the values.
 - **`SYNC 0xA9`** — command, one-byte payload: `0x01` restores the chip's

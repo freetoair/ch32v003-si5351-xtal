@@ -259,6 +259,10 @@ static const uint8_t FALLBACK_REGS[][2] = {
 // through the endurance budget in a tuning session.
 #define FRAME_SYNC_STORE 0xA5   // save to flash, then apply
 #define FRAME_SYNC_APPLY 0xA7   // apply only, leave the stored config alone
+// The same two for frequency B, the one selected by grounding pin 3. The A
+// frames above are unchanged, so an older tool still sets frequency A.
+#define FRAME_SYNC_STORE_B 0xAA
+#define FRAME_SYNC_APPLY_B 0xAB
 // Read frame: the payload is a list of register numbers. Reply: STATUS, count,
 // one value per register (0 where the read failed), checksum of the values.
 #define FRAME_SYNC_READ  0xA8
@@ -271,7 +275,9 @@ static const uint8_t FALLBACK_REGS[][2] = {
 #define ACK_BAD_CMD 0xE0
 #define RX_MAX_LEN 60
 // Reply on the software TX pin: STATUS, pair count, payload checksum,
-// FLAGS (bit0 = written to flash, bit1 = Si5351 acknowledged every write).
+// FLAGS (bit0 = written to flash, bit1 = Si5351 acknowledged every write,
+// bit2 = kept for later: the pin selects the other slot, so the output is
+// unchanged. Set rather than clear, so older firmware reads as "applied").
 #define ACK_OK 0xA6
 #define ACK_I2C_FAIL 0xE5
 
@@ -388,62 +394,158 @@ static void flash_program_word(uint32_t addr, uint32_t data) {
   FLASH->CTLR &= ~0x0001;
 }
 
-// Save (reg,val) pairs into the 1KB config page.
-// Layout: [uint16 count][pairs (2*n bytes)][uint8 checksum = sum of pair bytes]
-static void flash_save_pairs(const uint8_t *p, int n) {
-  uint8_t buf[64] = {0};
-  if (n < 0 || 2 + 2 * n + 1 > (int)sizeof(buf)) return;
-  buf[0] = (uint8_t)(n & 0xFF);
-  buf[1] = (uint8_t)((n >> 8) & 0xFF);
+// ---- Frequency A / B ----
+// Two register sequences, A and B, both kept in RAM. Package pin 3 (PA2),
+// pulled up inside, picks one: open = A, grounded = B. With no B set, the pin
+// is ignored. Made for a BFO that has to jump between USB and LSB: both come
+// off the same fixed 800 MHz PLL, so switching rewrites only the registers
+// that differ (the multisynth block, about 2 ms) with no PLL reset.
+struct Slot {
+  uint8_t n;                  // pairs; 0 = not set
+  uint8_t pairs[RX_MAX_LEN];
+};
+static Slot slot[2];
+static uint8_t cur_slot = 0;  // the slot whose sequence is on the chip
+
+#define SEL_PIN 2             // PA2, package pin 3
+#define SEL_DEBOUNCE_MS 10
+
+// Both slots live in the one config page, A where the single config always
+// was (so an existing board keeps its setting as A), B 64 bytes further on.
+// Each: [uint16 count][pairs (2*n bytes)][uint8 checksum = sum of pair bytes]
+#define SLOT_OFFSET(i) ((i) ? 0x40u : 0u)
+#define SLOT_BYTES 64
+
+static void slot_image(const Slot &sl, uint8_t *buf) {
+  for (int i = 0; i < SLOT_BYTES; i++) buf[i] = 0xFF;
+  if (sl.n == 0) return;
+  buf[0] = sl.n;
+  buf[1] = 0;
   uint8_t sum = 0;
-  for (int i = 0; i < n; i++) {
-    buf[2 + 2 * i] = p[2 * i];
-    buf[2 + 2 * i + 1] = p[2 * i + 1];
-    sum = (sum + p[2 * i] + p[2 * i + 1]) & 0xFF;
+  for (int i = 0; i < 2 * sl.n; i++) {
+    buf[2 + i] = sl.pairs[i];
+    sum = (uint8_t)(sum + sl.pairs[i]);
   }
-  buf[2 + 2 * n] = sum;
-  int total = 2 + 2 * n + 1;
-  int words = (total + 3) / 4; // number of 32-bit words, not bytes
+  buf[2 + 2 * sl.n] = sum;
+}
+
+// Read one stored slot. Returns false (and leaves it empty) if none is valid.
+static bool flash_read_slot(int i, Slot &out) {
+  const uint32_t base = SI5351_CFG_PAGE + SLOT_OFFSET(i);
+  out.n = 0;
+  uint16_t count = *(volatile uint16_t *)base;
+  if (count == 0xFFFF || count == 0 || count > RX_MAX_LEN / 2) return false;
+  uint8_t sum = 0;
+  for (int k = 0; k < 2 * count; k++) {
+    out.pairs[k] = *(volatile uint8_t *)(base + 2 + k);
+    sum = (uint8_t)(sum + out.pairs[k]);
+  }
+  if (sum != *(volatile uint8_t *)(base + 2 + 2 * count)) return false;
+  out.n = (uint8_t)count;
+  return true;
+}
+
+// Store slot i as given, keeping whatever is stored (not merely applied) in
+// the other slot: the page can only be erased as a whole.
+static void flash_save_slot(int i, const Slot &sl) {
+  Slot other;
+  flash_read_slot(1 - i, other);
+  uint8_t img[2][SLOT_BYTES];
+  slot_image(i == 0 ? sl : other, img[0]);
+  slot_image(i == 0 ? other : sl, img[1]);
   // The page must be unlocked before the erase, otherwise the erase is
   // silently ignored (WRPRTERR) and the following program writes land on
   // stale, non-erased flash.
   flash_unlock();
   flash_erase_page(SI5351_CFG_PAGE);
-  for (int w = 0; w < words; w++) {
-    uint32_t word = 0;
-    int base = w * 4;
-    for (int k = 0; k < 4; k++) {
-      word |= ((uint32_t)(buf[base + k] & 0xFF) << (k * 8));
+  for (int s = 0; s < 2; s++) {
+    if (img[s][0] == 0xFF) continue;
+    for (int w = 0; w < SLOT_BYTES / 4; w++) {
+      uint32_t word = 0;
+      for (int k = 0; k < 4; k++) word |= (uint32_t)img[s][4 * w + k] << (8 * k);
+      flash_program_word(SI5351_CFG_PAGE + SLOT_OFFSET(s) + 4 * w, word);
     }
-    flash_program_word(SI5351_CFG_PAGE + base, word);
   }
   flash_lock();
 }
 
-// Load saved config from flash and replay it to Si5351. Returns false if no valid config.
-// skip_load leaves reg 183 out, for restoring the chip's own crystal load.
-static bool flash_load_and_apply(bool skip_load) {
-  uint16_t count = *(volatile uint16_t *)SI5351_CFG_PAGE;
-  if (count == 0xFFFF || count == 0 || count > RX_MAX_LEN / 2) return false;
-  uint8_t sum = 0;
-  for (int i = 0; i < count; i++) {
-    uint8_t reg = *(volatile uint8_t *)(SI5351_CFG_PAGE + 2 + 2 * i);
-    uint8_t val = *(volatile uint8_t *)(SI5351_CFG_PAGE + 3 + 2 * i);
-    sum = (sum + reg + val) & 0xFF;
+// Fill both slots from flash; A falls back to the built-in table.
+static bool load_slots(void) {
+  bool stored = flash_read_slot(0, slot[0]);
+  if (!stored) {
+    slot[0].n = (uint8_t)(sizeof(FALLBACK_REGS) / sizeof(FALLBACK_REGS[0]));
+    for (int k = 0; k < 2 * slot[0].n; k++) slot[0].pairs[k] = (&FALLBACK_REGS[0][0])[k];
   }
-  uint8_t stored = *(volatile uint8_t *)(SI5351_CFG_PAGE + 2 + 2 * count);
-  if (sum != stored) return false;
+  flash_read_slot(1, slot[1]);
+  return stored;
+}
+
+static bool sel_pin_low(void) {
+  return (GPIOA->INDR & (1u << SEL_PIN)) == 0;
+}
+
+static uint8_t wanted_slot(bool pin_low) {
+  return (pin_low && slot[1].n) ? 1 : 0;
+}
+
+// Put a slot's whole sequence on the chip. skip_load leaves reg 183 out, for
+// restoring the chip's own crystal load.
+static bool apply_slot(int i, bool skip_load) {
   uint8_t pairs[RX_MAX_LEN];
   int m = 0;
-  for (int i = 0; i < count; i++) {
-    uint8_t reg = *(volatile uint8_t *)(SI5351_CFG_PAGE + 2 + 2 * i);
-    if (skip_load && reg == SI5351_CRYSTAL_LOAD) continue;
-    pairs[2 * m] = reg;
-    pairs[2 * m + 1] = *(volatile uint8_t *)(SI5351_CFG_PAGE + 3 + 2 * i);
+  for (int k = 0; k < slot[i].n; k++) {
+    if (skip_load && slot[i].pairs[2 * k] == SI5351_CRYSTAL_LOAD) continue;
+    pairs[2 * m] = slot[i].pairs[2 * k];
+    pairs[2 * m + 1] = slot[i].pairs[2 * k + 1];
     m++;
   }
-  si5351_apply(pairs, m);
-  return true;
+  cur_slot = (uint8_t)i;
+  return si5351_apply(pairs, m);
+}
+
+// Switch the chip from the current slot to slot i, writing only the pairs
+// whose value differs. The PLL is reset only if a PLL or crystal load
+// register actually changed; a plain frequency jump needs none.
+static void switch_slot(int i) {
+  const Slot &from = slot[cur_slot];
+  const Slot &to = slot[i];
+  bool pll_changed = false;
+  for (int k = 0; k < to.n; k++) {
+    uint8_t reg = to.pairs[2 * k], val = to.pairs[2 * k + 1];
+    if (reg == 177) continue;                   // PLL reset, done below if needed
+    bool same = false;
+    for (int j = 0; j < from.n; j++) {
+      if (from.pairs[2 * j] == reg) { same = (from.pairs[2 * j + 1] == val); break; }
+    }
+    if (same) continue;
+    i2c_write_reg(reg, val);
+    if ((reg >= 26 && reg <= 41) || reg == SI5351_CRYSTAL_LOAD) pll_changed = true;
+  }
+  if (pll_changed) i2c_write_reg(177, 0xA0);
+  cur_slot = (uint8_t)i;
+}
+
+static void sel_pin_begin(void) {
+  RCC->APB2PCENR |= RCC_APB2Periph_GPIOA;
+  GPIOA->CFGLR &= ~(0xFu << (4 * SEL_PIN));
+  GPIOA->CFGLR |= ((uint32_t)GPIO_CNF_IN_PUPD) << (4 * SEL_PIN);
+  GPIOA->BSHR = 1u << SEL_PIN;                  // pull-up
+  delayMicroseconds(100);                       // let the pull-up charge the pin
+}
+
+static bool sel_low = false;                    // debounced pin state
+static bool sel_raw = false;
+static uint32_t sel_since = 0;
+
+// Called from loop(): follow the pin, with debounce.
+static void poll_sel_pin(void) {
+  bool raw = sel_pin_low();
+  uint32_t now = millis();
+  if (raw != sel_raw) { sel_raw = raw; sel_since = now; return; }
+  if (raw == sel_low || (uint32_t)(now - sel_since) < SEL_DEBOUNCE_MS) return;
+  sel_low = raw;
+  uint8_t want = wanted_slot(sel_low);
+  if (want != cur_slot && si5351_ok) switch_slot(want);
 }
 
 static uint8_t rx_state = 0;
@@ -453,22 +555,31 @@ static uint8_t rx_len = 0;
 static uint8_t rx_expected = 0;
 static uint16_t rx_sum = 0;
 
-static void process_config(const uint8_t *p, int n, bool store) {
+static void process_config(const uint8_t *p, int n, bool store, int i) {
   if (!si5351_ok) si5351_begin();  // retry if the chip was absent at boot
   capture_boot_load();             // before this frame can change it
+  slot[i].n = (uint8_t)n;
+  for (int k = 0; k < 2 * n; k++) slot[i].pairs[k] = p[k];
   if (store) {
-    flash_save_pairs(p, n);
+    flash_save_slot(i, slot[i]);   // an empty frame deletes the stored slot
     diag_stored++;
   }
-  bool applied = si5351_apply(p, n);
-  diag_applied++;
+  if (i == 0 && n == 0) load_slots();   // no A: the built-in table stands in
+  // Only the slot the pin selects goes on the output; the other just waits.
+  // An emptied B hands the output back to A.
+  uint8_t want = wanted_slot(sel_low);
+  bool live = (want == i);
+  bool applied = true;
+  if (live) applied = apply_slot(i, false);
+  else if (want != cur_slot) switch_slot(want);
+  if (live) diag_applied++;
 
   uint8_t sum = 0;
-  for (int i = 0; i < 2 * n; i++) sum = (uint8_t)(sum + p[i]);
+  for (int k = 0; k < 2 * n; k++) sum = (uint8_t)(sum + p[k]);
   tx_byte(applied ? ACK_OK : ACK_I2C_FAIL);
   tx_byte((uint8_t)n);
   tx_byte(sum);
-  tx_byte((uint8_t)((store ? 1 : 0) | (si5351_ok ? 2 : 0)));
+  tx_byte((uint8_t)((store ? 1 : 0) | (si5351_ok ? 2 : 0) | (live ? 0 : 4)));
 }
 
 // Answer a read frame. Reading changes nothing on the Si5351.
@@ -492,7 +603,8 @@ static void process_read(const uint8_t *regs, int n) {
 
 // Put the Si5351 back to normal without a power cycle: its own power-on crystal
 // load, then the stored config (without any load it carries) or the built-in
-// fallback, then a reset of both PLLs so they relock onto the crystal.
+// fallback, then a reset of both PLLs so they relock onto the crystal. Both
+// slots go back to what is stored, dropping anything only applied.
 static void process_command(uint8_t cmd) {
   if (cmd != CMD_RESTORE_DEFAULTS && cmd != CMD_CLEAR_STORED) {
     tx_byte(ACK_BAD_CMD);
@@ -509,13 +621,8 @@ static void process_command(uint8_t cmd) {
     flash_lock();
   }
   bool ok = boot_load_known && i2c_write_reg(SI5351_CRYSTAL_LOAD, boot_load);
-  bool from_flash = flash_load_and_apply(true);
-  if (from_flash) {
-    ok = ok && i2c_diag_fail_cnt == 0;
-  } else {
-    ok = si5351_apply(&FALLBACK_REGS[0][0],
-                      (int)(sizeof(FALLBACK_REGS) / sizeof(FALLBACK_REGS[0]))) && ok;
-  }
+  bool from_flash = load_slots();
+  ok = apply_slot(wanted_slot(sel_low), true) && ok;
   ok = i2c_write_reg(177, 0xA0) && ok;   // PLL soft reset, A and B
   cfg_from_flash = from_flash ? 1 : 0;
   tx_byte(ok ? ACK_OK : ACK_I2C_FAIL);
@@ -528,7 +635,7 @@ static void on_serial_byte(uint8_t b) {
   switch (rx_state) {
     case 0:
       if (b == FRAME_SYNC_STORE || b == FRAME_SYNC_APPLY || b == FRAME_SYNC_READ ||
-          b == FRAME_SYNC_CMD) {
+          b == FRAME_SYNC_CMD || b == FRAME_SYNC_STORE_B || b == FRAME_SYNC_APPLY_B) {
         rx_sync = b;
         rx_state = 1;
       }
@@ -551,7 +658,9 @@ static void on_serial_byte(uint8_t b) {
         else if (rx_sync == FRAME_SYNC_CMD) {
           if (rx_expected == 1) process_command(rx_payload[0]);
         }
-        else process_config(rx_payload, rx_expected / 2, rx_sync == FRAME_SYNC_STORE);
+        else process_config(rx_payload, rx_expected / 2,
+                            rx_sync == FRAME_SYNC_STORE || rx_sync == FRAME_SYNC_STORE_B,
+                            (rx_sync == FRAME_SYNC_STORE_B || rx_sync == FRAME_SYNC_APPLY_B) ? 1 : 0);
       }
       rx_state = 0;
       break;
@@ -561,13 +670,12 @@ static void on_serial_byte(uint8_t b) {
 void setup() {
   uart_rx_begin(115200);
   tx_begin();
+  sel_pin_begin();
+  sel_raw = sel_low = sel_pin_low();
   si5351_begin();
   capture_boot_load();   // before the stored config can overwrite it
-  cfg_from_flash = flash_load_and_apply(false) ? 1 : 0;
-  if (!cfg_from_flash) {
-    si5351_apply(&FALLBACK_REGS[0][0],
-                 (int)(sizeof(FALLBACK_REGS) / sizeof(FALLBACK_REGS[0])));
-  }
+  cfg_from_flash = load_slots() ? 1 : 0;
+  apply_slot(wanted_slot(sel_low), false);
   // Diagnostic sweep last, so it never delays the output coming up. Costs
   // ~100 ms of NAKs; the result is readable over the debug probe.
   i2c_scan_bus();
@@ -582,4 +690,5 @@ void loop() {
     if (b < 0) break;
     on_serial_byte((uint8_t)b);
   }
+  poll_sel_pin();
 }

@@ -28,6 +28,8 @@ import si5351_gen as g
 FRAME_SYNC_STORE = 0xA5   # controller saves to flash, then applies
 FRAME_SYNC_APPLY = 0xA7   # controller only applies; the stored config is untouched
 FRAME_SYNC_READ = 0xA8    # controller reads the listed Si5351 registers back
+FRAME_SYNC_STORE_B = 0xAA # the same two for frequency B (pin 3 grounded)
+FRAME_SYNC_APPLY_B = 0xAB
 FRAME_SYNC_CMD = 0xA9     # one-byte command, below
 CMD_RESTORE_DEFAULTS = 0x01   # power-on crystal load + stored config
 CMD_CLEAR_STORED = 0x02       # erase the stored config, then restore
@@ -63,7 +65,7 @@ def parse_reg_list(text):
     return addrs
 
 
-def build_frame(registers, store=True):
+def build_frame(registers, store=True, slot="A"):
     """Registers as a list of (addr, val) -> byte sequence for serial.
 
     Frame format: SYNC LEN PAYLOAD CHECKSUM (CHECKSUM = sum(payload) & 0xFF).
@@ -76,7 +78,10 @@ def build_frame(registers, store=True):
         payload.append(val & 0xFF)
     checksum = sum(payload) & 0xFF
     frame = bytearray()
-    frame.append(FRAME_SYNC_STORE if store else FRAME_SYNC_APPLY)
+    if slot == "B":
+        frame.append(FRAME_SYNC_STORE_B if store else FRAME_SYNC_APPLY_B)
+    else:
+        frame.append(FRAME_SYNC_STORE if store else FRAME_SYNC_APPLY)
     frame.append(len(payload))
     frame += payload
     frame.append(checksum)
@@ -156,6 +161,20 @@ class Si5351Tool(QWidget):
             % (g._fmt_hz(g.FREQ_MIN), g._fmt_hz(g.FREQ_MAX)))
         row.addWidget(self.freq_edit)
         layout.addLayout(row)
+
+        # A second frequency, put out while package pin 3 is grounded: a BFO
+        # that jumps between USB and LSB. Empty = pin 3 does nothing.
+        rowb = QHBoxLayout()
+        rowb.addWidget(QLabel("Frequency B:"))
+        self.freq_b_edit = QLineEdit()
+        self.freq_b_edit.setPlaceholderText(
+            "optional — used while pin 3 is grounded (e.g. USB/LSB)")
+        self.freq_b_edit.setToolTip(
+            "Leave empty for a single frequency. When set, grounding package "
+            "pin 3 switches the same output to this frequency within a few ms; "
+            "opening it switches back.")
+        rowb.addWidget(self.freq_b_edit)
+        layout.addLayout(rowb)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Output (CLK):"))
@@ -305,6 +324,7 @@ class Si5351Tool(QWidget):
         self.xtal_combo.currentIndexChanged.connect(self.on_auto_send)
         self.load_combo.currentIndexChanged.connect(self.on_auto_send)
         self.freq_edit.editingFinished.connect(self.on_auto_send)
+        self.freq_b_edit.editingFinished.connect(self.on_auto_send)
 
         self.resize(560, 480)
 
@@ -336,25 +356,27 @@ class Si5351Tool(QWidget):
 
     # ---------------- helpers ----------------
 
-    def _read_freq(self):
-        """Parse the frequency field. Returns None and reports why if unusable."""
+    def _read_freq(self, slot="A"):
+        """Parse a frequency field. Returns None and reports why if unusable."""
+        edit = self.freq_b_edit if slot == "B" else self.freq_edit
         try:
-            return g.parse_freq(self.freq_edit.text())
+            return g.parse_freq(edit.text())
         except ValueError:
             self.log.append(
-                "Could not read the frequency. Enter it in Hz, or with a k / M "
-                "suffix — for example 10.245 MHz, 32.768k, or 3579545.")
+                "Could not read frequency %s. Enter it in Hz, or with a k / M "
+                "suffix — for example 10.245 MHz, 32.768k, or 3579545." % slot)
             self.serial_status.setText("bad frequency")
             return None
 
-    def _registers(self):
+    def _registers(self, slot="A"):
         """Current settings -> (result dict, None) or (None, message).
+        `slot` picks the frequency field; everything else is shared.
 
         With a crystal load selected and a board connected, reg 183 is read
         first and only its bits 7:6 are changed: the reserved bits 5:0 are not
         the same on every chip, and writing the datasheet's value broke the
         oscillator on one. Without a board the datasheet's bits are used."""
-        freq_hz = self._read_freq()
+        freq_hz = self._read_freq(slot)
         if freq_hz is None:
             return None, None
         keep = g.CRYSTAL_LOAD_RESERVED
@@ -404,16 +426,40 @@ class Si5351Tool(QWidget):
         self._send(store=True)
 
     def _send(self, store):
+        """Send frequency A, then B. An empty B field sends an empty B frame,
+        so a B set earlier does not linger on the board."""
         if self.serial is None or not self.serial.is_open:
             self.log.append("[serial] click 'Connect' first")
             return
-        res, err = self._registers()
+        if not self._send_slot("A", store):
+            return
+        if self.freq_b_edit.text().strip():
+            self._send_slot("B", store)
+        else:
+            self._clear_b(store)
+
+    def _clear_b(self, store):
+        try:
+            self.serial.reset_input_buffer()
+            self.serial.write(build_frame([], store=store, slot="B"))
+            self.serial.flush()
+            ack = self.serial.read(ACK_LEN)
+        except Exception as e:
+            self.log.append("[serial] error: %s" % e)
+            return
+        # Firmware without frequency B does not answer; with none set, that
+        # is nothing to report.
+        if len(ack) == ACK_LEN and ack[0] == ACK_OK and store:
+            self.log.append("[controller] B: none (pin 3 does nothing).")
+
+    def _send_slot(self, slot, store):
+        res, err = self._registers(slot)
         if res is None:
             if err:
-                self.log.append("Not sent — %s" % err)
+                self.log.append("Not sent — %s: %s" % (slot, err))
                 self.serial_status.setText("not sent")
-            return
-        frame = build_frame(res["registers"], store=store)
+            return False
+        frame = build_frame(res["registers"], store=store, slot=slot)
         try:
             self.serial.reset_input_buffer()
             n = self.serial.write(frame)
@@ -421,38 +467,49 @@ class Si5351Tool(QWidget):
         except Exception as e:
             self.serial_status.setText("send error: %s" % e)
             self.log.append("[serial] error: %s" % e)
-            return
+            return False
         load = res["xtal_load_pf"]
         if load is None:
             load_txt = "chip default"
         else:
             load_txt = "%d pF (reg 183 = 0x%02X)" % (load, res["registers"][0][1])
-        self.log.append("[serial] sent %d bytes, %d pairs — %s, %s, %s, %d ppb, load %s" % (
-            n, len(res["registers"]), g._fmt_hz(res["freq_hz"]),
+        self.log.append("[serial] %s: sent %d bytes, %d pairs — %s, %s, %s, %d ppb, load %s" % (
+            slot, n, len(res["registers"]), g._fmt_hz(res["freq_hz"]),
             "CLK%d" % res["clk"], DRIVES.get(res["drive"], "?"), res["correction"],
             load_txt))
-        self._read_ack(store, len(res["registers"]))
+        return self._read_ack(store, len(res["registers"]), slot)
 
-    def _read_ack(self, store, pairs):
+    def _read_ack(self, store, pairs, slot="A"):
+        """Report the controller's reply. Returns True if it confirmed."""
         try:
             ack = self.serial.read(ACK_LEN)
         except Exception as e:
             self.serial_status.setText("read error: %s" % e)
-            return
+            return False
         if len(ack) < ACK_LEN:
             self.serial_status.setText("no reply from controller")
-            self.log.append(
-                "No reply. The controller answers on package pin 7 (PC4) — check "
-                "that it is wired to the adapter's RX. The frequency may still "
-                "have been set; only the confirmation is missing.")
-            return
+            if slot == "B":
+                self.log.append(
+                    "No reply to frequency B. Firmware older than frequency B "
+                    "does not know it — flash the current one.")
+            else:
+                self.log.append(
+                    "No reply. The controller answers on package pin 7 (PC4) — "
+                    "check that it is wired to the adapter's RX. The frequency "
+                    "may still have been set; only the confirmation is missing.")
+            return False
         status, count, checksum, flags = ack[0], ack[1], ack[2], ack[3]
         stored = bool(flags & 1)
         chip_ok = bool(flags & 2)
+        live = not flags & 4    # bit2: kept for when the pin selects it
         if status == ACK_OK:
-            what = "stored in flash and applied" if stored else "applied (not stored)"
+            if live:
+                what = "stored in flash and applied" if stored else "applied (not stored)"
+            else:
+                what = ("stored in flash; pin 3 selects the other frequency now"
+                        if stored else "kept for when pin 3 selects it (not stored)")
             self.serial_status.setText("confirmed — %s" % what)
-            self.log.append("[controller] %d registers %s." % (count, what))
+            self.log.append("[controller] %s: %d registers %s." % (slot, count, what))
             if count != pairs:
                 self.log.append(
                     "Warning: controller reports %d registers, %d were sent."
@@ -471,6 +528,7 @@ class Si5351Tool(QWidget):
         if status == ACK_OK and not chip_ok:
             self.log.append("Note: the controller flagged an earlier I2C problem.")
         del checksum
+        return status == ACK_OK
 
     def on_auto_send(self, *_):
         # Apply-only, so turning the knob costs no flash write cycles; press
@@ -579,8 +637,8 @@ class Si5351Tool(QWidget):
     def on_clear(self):
         ask = QMessageBox.question(
             self, "Clear stored config",
-            "Erase the frequency stored on the board? It will run the built-in "
-            "82 MHz on CLK0 until you press Send sequence again.")
+            "Erase the frequencies stored on the board (A and B)? It will run "
+            "the built-in 82 MHz on CLK0 until you press Send sequence again.")
         if ask != QMessageBox.Yes:
             return
         self._command(CMD_CLEAR_STORED)
