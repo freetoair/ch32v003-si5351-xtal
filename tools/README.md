@@ -126,10 +126,14 @@ chip's `000000`:
 | `0x80` | 8 pF | +9 ppm |
 | `0xC0` | 10 pF | −15 ppm |
 
-This field, however, writes bits 5:0 as `010010`, as the datasheet and the
-Etherkit library do, and on that board that broke the carrier up into noise
-spread over several MHz until a power cycle. Read reg 183 first; if it does
-not come back as `xx010010`, do not use this field on that board. So:
+Bits 5:0 are reserved. The datasheet and the Etherkit library write them as
+`010010`, and on that board that broke the carrier up into noise spread over
+several MHz until a power cycle. So when a board is connected, the tool reads
+reg 183 first and changes only bits 7:6; if the read fails (for example,
+firmware older than the register read), it refuses to send a load rather than
+guess. With 8 pF, that board came out at +9.3 ppm with no correction at all.
+**Generate** and the fallback button use the datasheet's bits when no board is
+connected. So:
 
 - Experiment with **Auto-send on change (apply only)** ticked. Nothing is
   written to flash, and power-cycling the board brings it back.

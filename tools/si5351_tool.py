@@ -326,10 +326,23 @@ class Si5351Tool(QWidget):
             return None
 
     def _registers(self):
-        """Current settings -> (result dict, None) or (None, message)."""
+        """Current settings -> (result dict, None) or (None, message).
+
+        With a crystal load selected and a board connected, reg 183 is read
+        first and only its bits 7:6 are changed: the reserved bits 5:0 are not
+        the same on every chip, and writing the datasheet's value broke the
+        oscillator on one. Without a board the datasheet's bits are used."""
         freq_hz = self._read_freq()
         if freq_hz is None:
             return None, None
+        keep = g.CRYSTAL_LOAD_RESERVED
+        if (self.load_combo.currentData() is not None
+                and self.serial is not None and self.serial.is_open):
+            vals, err = self._read_regs([g.CRYSTAL_LOAD])
+            if vals is None:
+                return None, ("Crystal load needs reg 183 read from the board "
+                              "first, and that failed: %s" % err)
+            keep = vals[0] & 0x3F
         try:
             return g.set_freq(
                 freq_hz,
@@ -338,9 +351,10 @@ class Si5351Tool(QWidget):
                 xtal_hz=self.xtal_combo.currentData(),
                 correction=self.corr_spin.value(),
                 xtal_load_pf=self.load_combo.currentData(),
+                xtal_load_keep=keep,
             ), None
         except g.FrequencyOutOfRange as e:
-            return None, str(e)
+            return None, "Out of range: %s" % e
 
     # ---------------- serial ----------------
 
@@ -374,8 +388,8 @@ class Si5351Tool(QWidget):
         res, err = self._registers()
         if res is None:
             if err:
-                self.log.append("Not sent — out of range: %s" % err)
-                self.serial_status.setText("out of range")
+                self.log.append("Not sent — %s" % err)
+                self.serial_status.setText("not sent")
             return
         frame = build_frame(res["registers"], store=store)
         try:
@@ -387,10 +401,14 @@ class Si5351Tool(QWidget):
             self.log.append("[serial] error: %s" % e)
             return
         load = res["xtal_load_pf"]
+        if load is None:
+            load_txt = "chip default"
+        else:
+            load_txt = "%d pF (reg 183 = 0x%02X)" % (load, res["registers"][0][1])
         self.log.append("[serial] sent %d bytes, %d pairs — %s, %s, %s, %d ppb, load %s" % (
             n, len(res["registers"]), g._fmt_hz(res["freq_hz"]),
             "CLK%d" % res["clk"], DRIVES.get(res["drive"], "?"), res["correction"],
-            "chip default" if load is None else "%d pF" % load))
+            load_txt))
         self._read_ack(store, len(res["registers"]))
 
     def _read_ack(self, store, pairs):
@@ -443,6 +461,28 @@ class Si5351Tool(QWidget):
 
     # ---------------- advanced ----------------
 
+    def _read_regs(self, addrs, partial=False):
+        """Read Si5351 registers through the controller.
+        Returns (values, None) or (None, reason). With `partial`, a reply in
+        which some reads failed still returns the values (0x00 for those)."""
+        try:
+            self.serial.reset_input_buffer()
+            self.serial.write(build_read_frame(addrs))
+            self.serial.flush()
+            reply = self.serial.read(len(addrs) + 3)
+        except Exception as e:
+            return None, "serial error: %s" % e
+        if len(reply) < len(addrs) + 3:
+            return None, ("no reply (%d of %d bytes). Firmware older than the "
+                          "register read does not answer it — flash the current one."
+                          % (len(reply), len(addrs) + 3))
+        status, count, vals, checksum = reply[0], reply[1], reply[2:-1], reply[-1]
+        if count != len(addrs) or checksum != sum(vals) & 0xFF:
+            return None, "the reply was garbled; try again."
+        if status != ACK_OK and not partial:
+            return None, "the Si5351 did not acknowledge every read."
+        return list(vals), (None if status == ACK_OK else "partial")
+
     def on_read(self):
         """'Read' button: ask the controller for the listed Si5351 registers."""
         if self.serial is None or not self.serial.is_open:
@@ -454,29 +494,15 @@ class Si5351Tool(QWidget):
             self.log.append("Could not read the register list. Use numbers 0-255, "
                             "decimal or 0x hex, ranges like 26-33, at most 60.")
             return
-        try:
-            self.serial.reset_input_buffer()
-            self.serial.write(build_read_frame(addrs))
-            self.serial.flush()
-            reply = self.serial.read(len(addrs) + 3)
-        except Exception as e:
-            self.serial_status.setText("serial error: %s" % e)
-            self.log.append("[serial] error: %s" % e)
+        vals, err = self._read_regs(addrs, partial=True)
+        if vals is None:
+            self.serial_status.setText("read failed")
+            self.log.append("[controller] read failed: %s" % err)
             return
-        if len(reply) < len(addrs) + 3:
-            self.serial_status.setText("no reply to the read")
-            self.log.append(
-                "No reply to the read (%d of %d bytes). Firmware older than the "
-                "register read does not answer it — flash the current one."
-                % (len(reply), len(addrs) + 3))
-            return
-        status, count, vals, checksum = reply[0], reply[1], reply[2:-1], reply[-1]
-        if count != len(addrs) or checksum != sum(vals) & 0xFF:
-            self.log.append("[controller] the read reply is garbled; try again.")
-            return
-        if status != ACK_OK:
+        if err:
             self.log.append("[controller] some reads were not acknowledged by the "
                             "Si5351; those show as 0x00.")
+        count = len(vals)
         self.serial_status.setText("read %d registers" % count)
         for a, v in zip(addrs, vals):
             role = register_role(a)
@@ -487,8 +513,8 @@ class Si5351Tool(QWidget):
         res, err = self._registers()
         if res is None:
             if err:
-                self.output.append("Out of range: %s" % err)
-                self.serial_status.setText("out of range")
+                self.output.append(err)
+                self.serial_status.setText("not generated")
             return
         lines = ["// C code (replace the line in main.cpp):", res["code"], ""]
         lines.append("// Registers (CLK%d, drive %s, crystal %s, corr %d ppb):" % (
@@ -519,7 +545,7 @@ class Si5351Tool(QWidget):
         res, err = self._registers()
         if res is None:
             if err:
-                self.output.append("Out of range: %s" % err)
+                self.output.append(err)
             return
         path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), os.pardir, "src", "main.cpp")
