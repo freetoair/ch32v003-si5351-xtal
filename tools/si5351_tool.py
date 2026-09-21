@@ -61,6 +61,8 @@ def register_role(addr):
         return "output enable"
     if addr == 177:
         return "PLL soft reset"
+    if addr == 183:
+        return "crystal load capacitance"
     if 16 <= addr <= 23:
         return "CLK%d_CTRL: multisynth source, drive" % (addr - 16)
     if 26 <= addr <= 33:
@@ -142,10 +144,23 @@ class Si5351Tool(QWidget):
         row3.addWidget(self.xtal_combo)
         row3.addWidget(QLabel("Correction (ppb):"))
         self.corr_spin = QSpinBox()
-        self.corr_spin.setRange(-10000, 10000)
+        # A cheap Si5351 board can be hundreds of ppm off (one measured
+        # +333 ppm), so the range has to reach far past a good crystal's spec.
+        self.corr_spin.setRange(-500000, 500000)
         self.corr_spin.setValue(0)
         self.corr_spin.setSuffix(" ppb")
         row3.addWidget(self.corr_spin)
+        # Coarse steps close a large offset quickly, fine ones trim it. Steps
+        # under ~30 ppb can do nothing: the PLL fraction is only that fine.
+        row3.addWidget(QLabel("Step:"))
+        self.corr_step = QComboBox()
+        for step in (10, 100, 1000, 10000, 100000):
+            self.corr_step.addItem("%d ppb" % step, step)
+        self.corr_step.setCurrentIndex(2)
+        self.corr_step.currentIndexChanged.connect(
+            lambda _: self.corr_spin.setSingleStep(self.corr_step.currentData()))
+        self.corr_spin.setSingleStep(self.corr_step.currentData())
+        row3.addWidget(self.corr_step)
         row3.addStretch(1)
         layout.addLayout(row3)
 
@@ -191,6 +206,19 @@ class Si5351Tool(QWidget):
 
         self.adv_box = QGroupBox("Advanced")
         adv = QVBoxLayout(self.adv_box)
+        # For experimenting with a board whose crystal runs far off: the load
+        # capacitance pulls it. By default the register is not written and the
+        # chip keeps whatever it powered up with. It sits under Advanced
+        # because on at least one board any write here broke the output up.
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Crystal load:"))
+        self.load_combo = QComboBox()
+        self.load_combo.addItem("chip default (not written)", None)
+        for pf in (0, 6, 8, 10):
+            self.load_combo.addItem("%d pF" % pf, pf)
+        row4.addWidget(self.load_combo)
+        row4.addStretch(1)
+        adv.addLayout(row4)
         arow = QHBoxLayout()
         self.gen_btn = QPushButton("Generate")
         self.gen_btn.clicked.connect(self.on_generate)
@@ -211,12 +239,16 @@ class Si5351Tool(QWidget):
         # auto-send: regenerate + send when a parameter changes (if enabled)
         self.corr_spin.valueChanged.connect(self.on_auto_send)
         self.xtal_combo.currentIndexChanged.connect(self.on_auto_send)
+        self.load_combo.currentIndexChanged.connect(self.on_auto_send)
         self.freq_edit.editingFinished.connect(self.on_auto_send)
 
         self.resize(560, 480)
 
     def on_advanced_toggled(self, on):
         self.adv_box.setVisible(bool(on))
+        if not on:
+            # A load nobody can see must not keep going out with every send.
+            self.load_combo.setCurrentIndex(0)
         self.resize(self.width(), 700 if on else 480)
 
     def refresh_ports(self):
@@ -263,6 +295,7 @@ class Si5351Tool(QWidget):
                 drive=self.drive_combo.currentData(),
                 xtal_hz=self.xtal_combo.currentData(),
                 correction=self.corr_spin.value(),
+                xtal_load_pf=self.load_combo.currentData(),
             ), None
         except g.FrequencyOutOfRange as e:
             return None, str(e)
@@ -311,9 +344,11 @@ class Si5351Tool(QWidget):
             self.serial_status.setText("send error: %s" % e)
             self.log.append("[serial] error: %s" % e)
             return
-        self.log.append("[serial] sent %d bytes, %d pairs — %s, %s, %s, %d ppb" % (
+        load = res["xtal_load_pf"]
+        self.log.append("[serial] sent %d bytes, %d pairs — %s, %s, %s, %d ppb, load %s" % (
             n, len(res["registers"]), g._fmt_hz(res["freq_hz"]),
-            "CLK%d" % res["clk"], DRIVES.get(res["drive"], "?"), res["correction"]))
+            "CLK%d" % res["clk"], DRIVES.get(res["drive"], "?"), res["correction"],
+            "chip default" if load is None else "%d pF" % load))
         self._read_ack(store, len(res["registers"]))
 
     def _read_ack(self, store, pairs):

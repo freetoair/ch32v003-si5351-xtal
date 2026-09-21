@@ -75,7 +75,22 @@ multisynth block for the chosen output.
 
 The crystals on these boards are not very accurate, so the output usually
 needs a frequency correction in parts-per-billion (ppb). Use the **Correction
-(ppb)** field (default 0, range −10000…+10000) to fine-tune the output:
+(ppb)** field (default 0, range −500000…+500000, i.e. ±500 ppm) to
+fine-tune the output. The **Step** list next to it sets how far one arrow
+click moves: 100000 or 10000 ppb to close a large offset, 100 or 10 ppb to trim.
+Steps smaller than about 30 ppb may not change the output, because the PLL
+fraction is not that fine.
+
+The ppb figure needed is the measured error, with the same sign:
+
+    correction_ppb = (measured − target) / target × 10⁹
+
+A positive correction lowers the output. For example, one board read
+100.033330 MHz instead of 100 MHz. That is +333300 ppb, and entering it put the
+output within 50 Hz of 100 MHz, which was as close as the spectrum analyzer
+could read. Offsets that large come from the Si5351 board's crystal, so do not
+assume ±10 ppm.
+
 
 1. Generate with correction = 0 and send the sequence.
 2. Measure the actual output on a reliable frequency counter or spectrum
@@ -89,6 +104,28 @@ needs a frequency correction in parts-per-billion (ppb). Use the **Correction
 
 The correction lives entirely in the tool: it is baked into the PLL registers
 that get sent, so the firmware needs no command and no setting of its own.
+
+### Crystal load (experimental)
+
+**Crystal load**, under **Advanced**, writes the Si5351 crystal load
+capacitance (reg 183: 0, 6, 8 or 10 pF) at the start of the sequence, ahead of
+the PLL, whose soft reset at the end relocks it. The default, *chip default
+(not written)*, leaves the register as the chip powered up, which is how
+every earlier version behaved.
+
+On one board (chip marked only "5351", crystal "25,00") the output ran
++333 ppm high with the register left alone, and writing it at all (10 pF and
+0 pF both tried) broke the carrier up into noise spread over several MHz until
+the board was power-cycled. The +333 ppm was corrected with **Correction**
+instead. So:
+
+- Experiment with **Auto-send on change (apply only)** ticked. Nothing is
+  written to flash, and power-cycling the board brings it back.
+- If you press **Send sequence** with a load selected, the load is stored and
+  replayed on every boot. To undo it, send again with *chip default* and
+  power-cycle the board.
+- Unticking **Advanced** puts it back to *chip default*, so a load nobody can
+  see is never sent by accident.
 
 **Hands-free correction**: tick **Auto-send on change (apply only)** and the
 tool regenerates and sends the sequence automatically every time you change

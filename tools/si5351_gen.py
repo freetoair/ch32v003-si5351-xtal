@@ -92,6 +92,11 @@ OUT_DIVBY4 = 3 << 2          # 0x0C
 OUT_DIV_SHIFT = 4
 OUTPUT_ENABLE_CTRL = 3       # reg 3: 0 = output enabled, 1 = disabled
 PLL_RESET = 177
+CRYSTAL_LOAD = 183
+# Crystal load capacitance, bits 7:6 of reg 183. Bits 5:0 are reserved and
+# must be written as 0b010010 (Si5351 datasheet / AN619, Etherkit library).
+CRYSTAL_LOAD_PF = {0: 0x00, 6: 0x40, 8: 0x80, 10: 0xC0}
+CRYSTAL_LOAD_RESERVED = 0x12
 PLL_RESET_A = 1 << 5
 PLL_RESET_B = 1 << 7
 
@@ -250,7 +255,8 @@ def ms_registers(clk, p1, p2, p3, int_mode, r_div, div_by_4, drive=0):
         clk_ctrl(clk, int_mode, drive),
     ]
 
-def set_freq(freq_hz, clk=0, pll_freq=PLL_FIXED, drive=0, xtal_hz=XTAL_FREQ, correction=0):
+def set_freq(freq_hz, clk=0, pll_freq=PLL_FIXED, drive=0, xtal_hz=XTAL_FREQ, correction=0,
+             xtal_load_pf=None):
     """Main function: compute everything and return the result.
 
     freq_hz  - target output frequency in Hz
@@ -260,6 +266,8 @@ def set_freq(freq_hz, clk=0, pll_freq=PLL_FIXED, drive=0, xtal_hz=XTAL_FREQ, cor
     xtal_hz   - board crystal frequency in Hz (25000000 or 27000000)
     correction- crystal frequency correction in parts-per-billion (ppb),
                   adjusted at runtime against a reliable frequency counter
+    xtal_load_pf - crystal load capacitance (0, 6, 8 or 10 pF) written to
+                  reg 183 ahead of the PLL; None leaves the register alone
     """
     if freq_hz < FREQ_MIN or freq_hz > FREQ_MAX:
         raise FrequencyOutOfRange(
@@ -285,7 +293,12 @@ def set_freq(freq_hz, clk=0, pll_freq=PLL_FIXED, drive=0, xtal_hz=XTAL_FREQ, cor
         (PLL_RESET, PLL_RESET_B if pll_idx else PLL_RESET_A),
         (OUTPUT_ENABLE_CTRL, 0xFF & ~(1 << clk)),
     ]
-    regs = pll_regs + ms_regs + tail
+    # The load sets the crystal's actual frequency, so it goes first and the
+    # PLL reset in the tail relocks onto the result.
+    head = []
+    if xtal_load_pf is not None:
+        head = [(CRYSTAL_LOAD, CRYSTAL_LOAD_PF[xtal_load_pf] | CRYSTAL_LOAD_RESERVED)]
+    regs = head + pll_regs + ms_regs + tail
     code = "si5351.set_freq({}ULL, SI5351_CLK{});".format(freq, clk)
     return {
         "freq_hz": freq_hz,
@@ -293,6 +306,7 @@ def set_freq(freq_hz, clk=0, pll_freq=PLL_FIXED, drive=0, xtal_hz=XTAL_FREQ, cor
         "drive": drive,
         "xtal_hz": xtal_hz,
         "correction": correction,
+        "xtal_load_pf": xtal_load_pf,
         "r_div": r_div,
         "div_by_4": div_by_4,
         "p1": p1, "p2": p2, "p3": p3,
