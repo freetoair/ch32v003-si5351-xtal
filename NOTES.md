@@ -233,8 +233,12 @@ root-owned — and hands ownership of `dist/` and `.build/` back at the end.
 
 CI builds both natively on every tag, which avoids the container entirely.
 
-## Open
+## The default crystal is 25 MHz
 
-- [ ] Set `SI5351_XTAL` in `main.cpp` to match the board's crystal (25 or
-      27 MHz). It only affects the boot-time fallback; the serial path carries
-      its own crystal choice.
+`SI5351_XTAL` in `main.cpp` is 25 MHz because that is what most Si5351 breakout
+boards carry. It only affects the boot-time fallback that runs before anything
+has been sent — every sequence from the tool carries its own crystal choice, so
+a 27 MHz board works correctly over serial without touching the firmware.
+
+Change it only if you want the *fallback* frequency to be right on a 27 MHz
+board as well.
