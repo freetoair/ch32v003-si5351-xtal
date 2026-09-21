@@ -65,6 +65,43 @@ def parse_reg_list(text):
     return addrs
 
 
+def decode_pll(vals):
+    """The eight PLL parameter registers -> (p1, p2, p3)."""
+    p3 = (vals[0] << 8) | vals[1] | ((vals[5] & 0xF0) << 12)
+    p1 = ((vals[2] & 0x03) << 16) | (vals[3] << 8) | vals[4]
+    p2 = ((vals[5] & 0x0F) << 16) | (vals[6] << 8) | vals[7]
+    return p1, p2, p3
+
+
+def correction_from_pll(p1, p2, p3):
+    """Work out which crystal and ppb correction produced these PLL registers.
+
+    The tool always runs the VCO at 800 MHz and folds the correction into the
+    reference, so the multiplier gives the assumed reference, and from it the
+    correction. Returns (xtal_hz, ppb) or None if neither crystal fits."""
+    ratio = (p1 + 512) / 128.0 + (p2 / 128.0 / p3 if p3 else 0)
+    if ratio <= 0:
+        return None
+    ref = g.PLL_FIXED / g.FREQ_MULT / ratio
+    best = None
+    for xtal in sorted(XTALS):
+        est = (ref / xtal - 1) * 1e9
+        if abs(est) > 600000:          # beyond the spinner and any sane crystal
+            continue
+        # The fixed-point maths makes several ppb values give the same
+        # registers; take the exact match nearest the estimate.
+        centre = int(round(est))
+        for d in sorted(range(-400, 401), key=abs):
+            if g.pll_calc(g.PLL_FIXED, xtal * g.FREQ_MULT, centre + d)[:3] == (p1, p2, p3):
+                cand = (xtal, centre + d)
+                break
+        else:
+            cand = (xtal, centre)
+        if best is None or abs(cand[1]) < abs(best[1]):
+            best = cand
+    return best
+
+
 def build_frame(registers, store=True, slot="A"):
     """Registers as a list of (addr, val) -> byte sequence for serial.
 
@@ -403,6 +440,10 @@ class Si5351Tool(QWidget):
     # ---------------- serial ----------------
 
     def on_connect(self):
+        """One button: Connect, or Disconnect while connected."""
+        if self.serial is not None and self.serial.is_open:
+            self._disconnect()
+            return
         port = self.port_combo.currentData()
         if not port:
             self.serial_status.setText("select a port")
@@ -420,6 +461,70 @@ class Si5351Tool(QWidget):
             self.serial = None
             self.serial_status.setText("error: %s" % e)
             self.log.append("[serial] could not connect: %s" % e)
+            return
+        self._show_connected(True)
+        self._sync_from_board()
+
+    def _disconnect(self):
+        """Let go of the port, e.g. before rewiring or unplugging the board."""
+        try:
+            self.serial.close()
+        except Exception:
+            pass
+        self.serial = None
+        self._show_connected(False)
+        self.serial_status.setText("disconnected")
+        self.log.append("[serial] disconnected")
+
+    def _show_connected(self, on):
+        self.connect_btn.setText("Disconnect" if on else "Connect")
+        # The port cannot change under an open connection.
+        self.port_combo.setEnabled(not on)
+        self.rescan_btn.setEnabled(not on)
+
+    def _sync_from_board(self):
+        """Fill crystal, correction and crystal load from what the board runs.
+
+        The correction lives only in the PLL registers on the board; a fresh
+        window would show 0 and the next send would quietly drop it."""
+        addrs = [3] + list(range(16, 24)) + list(range(26, 42)) + [g.CRYSTAL_LOAD]
+        vals, err = self._read_regs(addrs)
+        if vals is None:
+            self.log.append("Could not read the board's settings (%s). Set crystal "
+                            "and correction by hand before sending." % err)
+            return
+        r = dict(zip(addrs, vals))
+        enabled = [c for c in range(8) if not r[3] & (1 << c)]
+        clk = enabled[0] if enabled else 0
+        uses_pllb = bool(r[16 + clk] & 0x20)      # CLKn_CTRL PLL select
+        base = 34 if uses_pllb else 26
+        found = correction_from_pll(*decode_pll([r[a] for a in range(base, base + 8)]))
+        if found is None:
+            self.log.append("[board] PLL registers do not match a 25 or 27 MHz "
+                            "crystal; crystal and correction left as they are.")
+            return
+        xtal, ppb = found
+        widgets = (self.xtal_combo, self.corr_spin, self.load_combo, self.adv_chk)
+        for wdg in widgets:        # no auto-send while the fields are filled in
+            wdg.blockSignals(True)
+        try:
+            self.xtal_combo.setCurrentIndex(self.xtal_combo.findData(xtal))
+            self.corr_spin.setValue(max(self.corr_spin.minimum(),
+                                        min(self.corr_spin.maximum(), ppb)))
+            load_pf = {0x40: 6, 0x80: 8, 0xC0: 10}.get(r[g.CRYSTAL_LOAD] & 0xC0)
+            if load_pf is not None:
+                # Shown, not hidden: a load left out of the next send would be
+                # lost from flash at the next power cycle.
+                self.load_combo.setCurrentIndex(self.load_combo.findData(load_pf))
+                self.adv_chk.setChecked(True)
+                self.on_advanced_toggled(True)   # its signal is blocked here
+        finally:
+            for wdg in widgets:
+                wdg.blockSignals(False)
+        load_txt = ("%d pF" % load_pf) if load_pf else "0 pF (chip default)"
+        self.log.append("[board] running with a %s crystal, correction %+d ppb, "
+                        "crystal load %s (reg 183 = 0x%02X)."
+                        % (XTALS[xtal], ppb, load_txt, r[g.CRYSTAL_LOAD]))
 
     def on_send(self):
         """'Send sequence' button: commit — the controller stores it in flash."""

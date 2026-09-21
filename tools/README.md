@@ -105,6 +105,15 @@ assume ±10 ppm.
 The correction lives entirely in the tool: it is baked into the PLL registers
 that get sent, so the firmware needs no command and no setting of its own.
 
+On **Connect** the tool reads the PLL registers back from the board and works
+out which crystal and correction produced them, and fills both in; the log
+says what it found. So the window shows what the board runs, and the next
+**Send sequence** keeps that correction instead of quietly replacing
+it with 0. A crystal load found on the board is filled in too, with
+**Advanced** opened to show it, because a send without it would drop it from
+flash. Firmware older than the register read cannot be asked: set crystal and
+correction by hand there.
+
 ### Two frequencies: A and B (e.g. a BFO for USB/LSB)
 
 Fill in **Frequency B** as well, and the board holds two frequencies on the same
