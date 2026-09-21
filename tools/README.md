@@ -4,10 +4,10 @@ Tool for the PLL project (WCH CH32V003 + Si5351). You enter a target
 frequency, an output (CLK0–7), the output-stage drive current and the
 board's reference crystal (25 or 27 MHz), and the tool:
 - computes the Si5351 PLL/multisynth registers,
-- produces the C line for `main.cpp`,
+- produces a C line for anyone driving the chip with the Etherkit library,
 - sends the byte sequence to the microcontroller over serial — the controller
   stores it in flash and keeps running at that frequency,
-- or directly embeds the C line into `src/main.cpp`.
+- or writes the boot-time fallback table into `src/main.cpp`.
 
 ## Running
 
@@ -56,10 +56,10 @@ python3 tools/si5351_gen.py 82000000 0 0 27000000 100
 |---|---|
 | **Advanced** | Reveals the register maths and the C-code helpers. Off by default. |
 | **Generate** | *(Advanced)* Computes the registers and prints the C code + register table. |
-| **Copy C code to clipboard** | *(Advanced)* Copies the C line to the clipboard. |
+| **Copy C code to clipboard** | *(Advanced)* Copies the `si5351.set_freq(...)` line, for use in a sketch that does use the Etherkit library. |
 | **Connect** | Opens the selected serial port (115200 8N1). |
 | **Send sequence** | Commits: the controller stores the frame in flash, then applies it. No ACK — the firmware is receive-only. |
-| **Embed C line into main.cpp** | *(Advanced)* Replaces the existing `si5351.set_freq(...)` line in `src/main.cpp`. |
+| **Set boot-time fallback in main.cpp** | *(Advanced)* Rewrites the `FALLBACK_REGS` table — what an unconfigured board comes up on. Rebuild and flash for it to take effect. |
 
 The **Drive** dropdown (2/4/6/8 mA) selects the output-stage drive current;
 it is written to the low 2 bits of the CLKn control register.
@@ -172,10 +172,11 @@ crystal instead of the synthesized frequency.
 
 On boot (`setup()`), the controller tries to load the stored config from flash
 (page 0x08003C00) and apply it to the Si5351; if there is no stored config, it
-falls back to the default `set_freq(82 MHz, CLK0)`.
+falls back to the compiled-in `FALLBACK_REGS` table (82 MHz on CLK0).
 
-`0x3C00` is the last 1KB page of the 16KB flash. The firmware image must stay
-below it — check the end of `.data` in `firmware.map` after changing the code.
+`0x08003C00` is the last 1KB page of the 16KB flash. The firmware image must
+stay below it — check the end of `.data` in `firmware.map` after changing the
+code.
 
 ## Example
 

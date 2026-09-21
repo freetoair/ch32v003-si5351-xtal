@@ -145,7 +145,8 @@ The retry is structural rather than defensive: the first transaction after
 that happened to run first and warm things up.
 
 Dropping the library took the firmware from **12 096 to 2 972 bytes** of flash
-and **728 to 216 bytes** of RAM.
+and **728 to 216 bytes** of RAM. The software transmitter and the diagnostics
+added since bring it to **3 244 bytes** — still under a fifth of the 16 KB.
 
 ## Diagnostics
 
@@ -217,8 +218,8 @@ flash, config page included, so resend the sequence with the tool afterwards.
 ## Building the executables
 
 ```bash
-./tools/build_app.sh linux      # -> dist/si5351-tool      (~46 MB, one file)
-./tools/build_app.sh windows    # -> dist/si5351-tool.exe  (~28 MB, via Docker)
+./tools/build_app.sh linux      # -> dist/si5351-tool      (one file)
+./tools/build_app.sh windows    # -> dist/si5351-tool.exe  (via Docker)
 ```
 
 The Linux binary carries Python and Qt inside and links only against `libc`,
@@ -251,4 +252,6 @@ To change what an unconfigured board comes up on, regenerate the table:
 python3 tools/si5351_gen.py 82000000 0 0 27000000 0
 ```
 
-and paste the register pairs into `FALLBACK_REGS`.
+and paste the register pairs into `FALLBACK_REGS` — or just press
+**Set boot-time fallback in main.cpp** in the tool's Advanced section, which
+rewrites the table and the comment above it for you.

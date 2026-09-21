@@ -217,9 +217,9 @@ static const uint8_t FALLBACK_REGS[][2] = {
   {0x1E, 0x00}, {0x1F, 0x00}, {0x20, 0x00}, {0x21, 0x00},
   {0x2A, 0x42}, {0x2B, 0x40}, {0x2C, 0x00}, {0x2D, 0x02},   // MS0
   {0x2E, 0xE0}, {0x2F, 0xFB}, {0x30, 0xE8}, {0x31, 0x80},
-  {0x10, 0x0C},                                             // CLK0_CTRL: MS0 source
-  {0xB1, 0x20},                                             // PLLA soft reset
-  {0x03, 0xFE},                                             // enable CLK0 only
+  {0x10, 0x0C},                                             // CLK0_CTRL: multisynth source, drive
+  {0xB1, 0x20},                                             // PLL soft reset
+  {0x03, 0xFE},                                             // output enable
 };
 
 // ---- Serial RX state machine: frame = SYNC LEN PAYLOAD CHECKSUM ----
