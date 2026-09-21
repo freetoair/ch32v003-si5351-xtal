@@ -19,10 +19,10 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install platformio
-      - run: pio run
+      - run: pio run 2>&1 | tee build.log
       - run: |
           echo "### Firmware size" >> "$GITHUB_STEP_SUMMARY"
-          pio run --target size 2>&1 | grep -E "RAM:|Flash:" >> "$GITHUB_STEP_SUMMARY" || true
+          grep -E "RAM:|Flash:" build.log >> "$GITHUB_STEP_SUMMARY" || true
 
   app:
     name: tool (${{ matrix.os }})
