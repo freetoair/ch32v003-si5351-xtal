@@ -233,12 +233,22 @@ root-owned — and hands ownership of `dist/` and `.build/` back at the end.
 
 CI builds both natively on every tag, which avoids the container entirely.
 
-## The default crystal is 25 MHz
+## The boot-time fallback assumes a 25 MHz crystal
 
-`SI5351_XTAL` in `main.cpp` is 25 MHz because that is what most Si5351 breakout
-boards carry. It only affects the boot-time fallback that runs before anything
-has been sent — every sequence from the tool carries its own crystal choice, so
-a 27 MHz board works correctly over serial without touching the firmware.
+There is no `SI5351_XTAL` setting any more — it went away with the Etherkit
+library. What is left is `FALLBACK_REGS` in `main.cpp`, a register table
+generated for 82 MHz on CLK0 with a **25 MHz** crystal, which is what most
+Si5351 breakout boards carry.
 
-Change it only if you want the *fallback* frequency to be right on a 27 MHz
-board as well.
+It is used only when the config page is empty: on a board that has never been
+set, or right after a firmware upload. Every sequence sent from the tool
+carries its own crystal choice, so a 27 MHz board works correctly over serial
+with no firmware change at all.
+
+To change what an unconfigured board comes up on, regenerate the table:
+
+```bash
+python3 tools/si5351_gen.py 82000000 0 0 27000000 0
+```
+
+and paste the register pairs into `FALLBACK_REGS`.

@@ -87,9 +87,8 @@ needs a frequency correction in parts-per-billion (ppb). Use the **Correction
 4. The controller stores the corrected register set in flash, so the
    correction survives a reboot.
 
-The firmware's `#define SI5351_CORRECTION` is only used by the boot-time
-fallback `set_freq`; the runtime adjustment happens entirely in the tool's
-serial path, so no extra firmware command is needed.
+The correction lives entirely in the tool: it is baked into the PLL registers
+that get sent, so the firmware needs no command and no setting of its own.
 
 **Hands-free correction**: tick **Auto-send on change (apply only)** and the
 tool regenerates and sends the sequence automatically every time you change
@@ -306,8 +305,8 @@ v1.3, pin table p. 11).
 2. Open the tool, select the serial port the CH32V003 is on (e.g. `/dev/ttyUSBx` or `/dev/ttyACMx`).
 3. Enter the frequency, output and drive, select the board's crystal (25/27 MHz),
    click **Connect**, then **Send sequence**. Wire the USB-serial adapter's
-   **TX to pin 1**; its RX is unused.
-   Make sure `SI5351_XTAL` in `src/main.cpp` matches the board crystal
-   (it is only used by the boot-time fallback; the serial path is crystal-correct).
+   **TX to pin 1** and its **RX to pin 7**.
+   The crystal you pick here is carried in the sequence, so the firmware needs
+   no matching setting — see the note on `FALLBACK_REGS` in NOTES.md.
 4. The controller stores the sequence in flash and keeps running at that frequency —
    after a restart the same frequency is restored from flash.
